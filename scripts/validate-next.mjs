@@ -14,10 +14,20 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 const temporary = await mkdtemp(path.join(tmpdir(), "toolkit-next-"));
 const app = path.join(temporary, "starter");
 const env = { ...process.env, DISABLE_TELEMETRY: "1", NEXT_TELEMETRY_DISABLED: "1", GRAPHIFY_NO_AUTO_REFRESH: "1" };
+if (process.platform === "win32") {
+  // Skills clones Next's full repository; its fixture paths exceed Windows' default limit.
+  const count = Number(env.GIT_CONFIG_COUNT || 0);
+  assert(Number.isSafeInteger(count) && count >= 0, "Invalid inherited GIT_CONFIG_COUNT");
+  env[`GIT_CONFIG_KEY_${count}`] = "core.longpaths";
+  env[`GIT_CONFIG_VALUE_${count}`] = "true";
+  env.GIT_CONFIG_COUNT = String(count + 1);
+  assert.equal(execFileSync("git", ["config", "--get", "core.longpaths"], { env, encoding: "utf8" }).trim(), "true");
+}
 // Prove that validation does not depend on the caller's database credentials.
 for (const key of ["DATABASE_URL", "DATABASE_URL_UNPOOLED", "LOG_LEVEL"]) delete env[key];
 const expectedSkills = [
-  "deploy-to-vercel", "find-skills", "vercel-cli-with-tokens",
+  "deploy-to-vercel", "differential-review", "find-skills", "gh-fix-ci",
+  "next-bundle-optimizer", "next-dev-loop", "shadcn", "supabase-postgres-best-practices", "vercel-cli-with-tokens",
   "vercel-composition-patterns", "vercel-optimize", "vercel-react-best-practices",
   "vercel-react-view-transitions", "web-design-guidelines", "writing-guidelines",
 ];
@@ -46,12 +56,21 @@ async function checkDocs() {
     "AGENTS.md", "CLAUDE.md", "PRODUCT.md", "README.md", "docs/architecture.md",
     "docs/design.md", "docs/onboarding.md", "docs/quality.md", "docs/setup.md",
   ]);
+  const frameworkInstructions = await readFile(path.join(app, "AGENTS.md"), "utf8");
+  assert(frameworkInstructions.trim(), "Expected create-next-app framework instructions");
   const defaults = await readFile(path.join(root, "docs/06-project-defaults.md"), "utf8");
   for (const [destination, source] of Object.entries(manifest)) {
     assert(defaults.includes(destination), `Missing documented destination: ${destination}`);
     await mkdir(path.dirname(path.join(app, destination)), { recursive: true });
-    await cp(path.join(sources, source), path.join(app, destination));
+    if (destination === "AGENTS.md") {
+      await writeFile(path.join(app, destination), frameworkInstructions + "\n\n" + await readFile(path.join(sources, source), "utf8"));
+    } else {
+      await cp(path.join(sources, source), path.join(app, destination));
+    }
   }
+  const mergedInstructions = await readFile(path.join(app, "AGENTS.md"), "utf8");
+  assert(mergedInstructions.startsWith(frameworkInstructions), "Toolkit must preserve the scaffold AGENTS.md verbatim");
+  assert(mergedInstructions.includes(await readFile(path.join(sources, manifest["AGENTS.md"]), "utf8")), "Toolkit instructions must also be present");
   assert.equal((await readFile(path.join(app, "CLAUDE.md"), "utf8")).trim(), "@AGENTS.md");
   // Document templates contain destination-relative links, not toolkit-relative links.
   for (const destination of Object.keys(manifest)) {
@@ -67,12 +86,19 @@ async function checkSkills() {
   const copy = process.platform === "win32" ? " --copy" : "";
   run("npx --yes skills@latest add vercel-labs/agent-skills --skill vercel-react-best-practices vercel-composition-patterns web-design-guidelines writing-guidelines vercel-react-view-transitions vercel-optimize deploy-to-vercel vercel-cli-with-tokens --agent codex claude-code --yes" + copy);
   run("npx --yes skills@latest add vercel-labs/skills --skill find-skills --agent codex claude-code --yes" + copy);
+  // This disposable fixture selects optional skills to verify packaging, not a product's defaults.
+  run("npx --yes skills@latest add https://github.com/vercel/next.js/tree/canary/skills/next-dev-loop --skill next-dev-loop --agent codex claude-code --yes" + copy);
+  run("npx --yes skills@latest add https://github.com/vercel/next.js/tree/canary/skills/next-bundle-optimizer --skill next-bundle-optimizer --agent codex claude-code --yes" + copy);
+  run("npx --yes skills@latest add supabase/agent-skills --skill supabase-postgres-best-practices --agent codex claude-code --yes" + copy);
+  run("npx --yes skills@latest add https://github.com/openai/skills/tree/main/skills/.curated/gh-fix-ci --skill gh-fix-ci --agent codex claude-code --yes" + copy);
+  run("npx --yes skills@latest add https://github.com/trailofbits/skills/tree/main/plugins/differential-review --skill differential-review --agent codex claude-code --yes" + copy);
+  run("npx --yes skills@latest add shadcn/ui --skill shadcn --agent codex claude-code --yes" + copy);
   assert.deepEqual((await readdir(path.join(app, ".agents/skills"))).sort(), expectedSkills);
   const lock = JSON.parse(await readFile(path.join(app, "skills-lock.json"), "utf8"));
   assert.deepEqual(Object.keys(lock.skills).sort(), expectedSkills);
   for (const name of expectedSkills) {
     const canonical = await readFile(path.join(app, ".agents/skills", name, "SKILL.md"), "utf8");
-    assert(canonical.includes(`name: ${name}`));
+    assert(canonical.includes(`name: ${name}`) || canonical.includes(`name: "${name}"`), `Missing skill name: ${name}`);
     assert.equal(await readFile(path.join(app, ".claude/skills", name, "SKILL.md"), "utf8"), canonical);
     if (process.platform !== "win32") assert(!path.isAbsolute(await readlink(path.join(app, ".claude/skills", name))));
   }
@@ -119,6 +145,29 @@ try {
     await rm(path.join(app, "drizzle"), { recursive: true, force: true });
     await rm(path.join(app, "toolkit-sql-smoke.mjs"), { force: true });
   }
+}
+
+async function checkCleanTypecheck() {
+  const routeDirectory = path.join(app, "src/app/api/typecheck-probe");
+  await mkdir(routeDirectory, { recursive: true });
+  try {
+    await writeFile(path.join(routeDirectory, "route.ts"), "export function GET(_request: number) { return Response.json({ ok: true }); }\n");
+    await rm(path.join(app, ".next"), { recursive: true, force: true });
+    await rm(path.join(app, "tsconfig.tsbuildinfo"), { force: true });
+    let rejected = false;
+    try { execSync("npm run typecheck", { cwd: app, env, encoding: "utf8", stdio: "pipe", timeout: 120_000 }); }
+    catch (error) {
+      assert.equal(error.status, 2);
+      assert.match(error.stdout + error.stderr, /typecheck-probe/);
+      assert.match(error.stdout + error.stderr, /RouteHandlerConfig/);
+      rejected = true;
+    }
+    assert(rejected, "Clean typecheck must reject invalid route signatures without a prior build");
+  } finally { await rm(routeDirectory, { recursive: true, force: true }); }
+  await rm(path.join(app, ".next"), { recursive: true, force: true });
+  await rm(path.join(app, "tsconfig.tsbuildinfo"), { force: true });
+  run("npm run typecheck");
+  console.log("PASS clean typecheck generates route types and rejects invalid route handlers before build");
 }
 
 async function checkServerBoundary() {
@@ -194,11 +243,12 @@ try {
   await cp(path.join(root, "templates/project/.graphifyignore.example"), path.join(app, ".graphifyignore"));
   const packageJson = JSON.parse(await readFile(packageFile, "utf8"));
   Object.assign(packageJson.scripts, {
-    lint: "eslint .", typecheck: "tsc --noEmit",
+    lint: "eslint .", typecheck: "next typegen && tsc --noEmit",
+    "lint:typed": "eslint --config eslint.typed.config.mjs .",
     "lint:rules": "node scripts/verify-quality-rules.mjs ./eslint-rules/index.cjs",
     test: "vitest run", "test:watch": "vitest",
     "db:generate": "drizzle-kit generate", "db:migrate": "drizzle-kit migrate",
-    check: "npm run lint && npm run typecheck && npm run lint:rules && npm test && npm run build",
+    check: "npm run lint && npm run typecheck && npm run lint:typed && npm run lint:rules && npm test && npm run build",
   });
   await writeFile(packageFile, JSON.stringify(packageJson, null, 2) + "\n");
   await checkDocs();
@@ -206,6 +256,7 @@ try {
   // Windows locks loaded native addons; the child must exit before removing its dependencies.
   execFileSync(process.execPath, [path.join(root, "scripts/check-eslint.mjs")], { cwd: app, env, stdio: "inherit", timeout: 120_000 });
   await checkSql();
+  await checkCleanTypecheck();
   await checkServerBoundary();
   run("npm run check");
   checkAudit();
@@ -218,4 +269,4 @@ try {
   await rm(temporary, { recursive: true, force: true });
 }
 
-console.log(`PASS ${process.platform}: documentation contracts, Next/Drizzle templates, quality guards, tests, SQL, build, audit, HTTP and nine local skills`);
+console.log(`PASS ${process.platform}: documentation contracts, Next/Drizzle templates, quality guards, tests, SQL, build, audit, HTTP and ${expectedSkills.length} selected local skills`);
